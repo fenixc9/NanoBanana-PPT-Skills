@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-PPT Generator - Generate PPT slide images using Google Gemini API.
+PPT Generator - Generate proper PPTX slides with text + AI illustrations.
 
-This script generates PPT slide images based on a slide plan and style template,
-then creates an HTML viewer for playback.
+Uses python-pptx for slide structure/text and Qwen wanx for illustrations.
 """
 
 import argparse
@@ -12,442 +11,308 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
-
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-DEFAULT_RESOLUTION = "2K"
-
-# Qwen wanx supported 16:9 resolutions
-RESOLUTION_MAP = {
-    "720p": "1280*720",
-    "2K": "1792*1024",
-}
-DEFAULT_TEMPLATE_PATH = "templates/viewer.html"
 OUTPUT_BASE_DIR = "outputs"
 
-# Style template markers
-TEMPLATE_START_MARKER = "## "
-TEMPLATE_END_MARKER = "## "
+# Dark theme colors
+COLOR_BG        = RGBColor(0x0D, 0x1B, 0x2A)  # deep navy
+COLOR_ACCENT    = RGBColor(0x00, 0xB4, 0xD8)  # cyan
+COLOR_HEADING   = RGBColor(0xFF, 0xFF, 0xFF)  # white
+COLOR_BODY      = RGBColor(0xCA, 0xD3, 0xE0)  # light grey
+COLOR_COVER_SUB = RGBColor(0x90, 0xC8, 0xE8)  # soft blue
+COLOR_CARD_BG   = RGBColor(0x1A, 0x2D, 0x44)  # card background
+
+SLIDE_W = Inches(13.33)
+SLIDE_H = Inches(7.5)
 
 
 # =============================================================================
-# Environment Configuration
+# Environment
 # =============================================================================
 
-def find_and_load_env() -> bool:
-    """
-    Find and load .env file from multiple locations.
-
-    Search priority:
-    1. Current script directory
-    2. Parent directories up to project root (containing .git or .env)
-    3. Claude Code skill standard location (~/.claude/skills/ppt-generator/)
-
-    Returns:
-        True if .env file was found and loaded, False otherwise.
-    """
+def find_and_load_env():
     current_dir = Path(__file__).parent
-    env_locations = [
+    for path in [
         current_dir / ".env",
-        *[parent / ".env" for parent in current_dir.parents],
         Path.home() / ".claude" / "skills" / "ppt-generator" / ".env",
-    ]
-
-    for env_path in env_locations:
-        if env_path.exists():
-            load_dotenv(env_path, override=True)
-            print(f"Loaded environment from: {env_path}")
-            return True
-
-        # Stop at project root if .git exists
-        if env_path.parent != current_dir and (env_path.parent / ".git").exists():
-            break
-
-    # Fallback: try default loading from system environment
+    ]:
+        if path.exists():
+            load_dotenv(path, override=True)
+            print(f"Loaded env: {path}")
+            return
     load_dotenv(override=True)
-    print("Warning: No .env file found, using system environment variables")
-    return False
+    print("Warning: No .env file found")
 
 
 # =============================================================================
-# Style Template
+# Qwen Image Generation (illustrations only)
 # =============================================================================
 
-def load_style_template(style_path: str) -> str:
-    """
-    Load and parse style template file.
-
-    Args:
-        style_path: Path to the style template markdown file.
-
-    Returns:
-        Extracted base prompt template string.
-    """
-    with open(style_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Extract base prompt template section
-    start_marker = "## "
-    end_marker = "## "
-
-    start_idx = content.find(start_marker)
-    end_idx = content.find(end_marker, start_idx + len(start_marker))
-
-    if start_idx == -1 or end_idx == -1:
-        print("Warning: Could not parse style template, using full content")
-        return content
-
-    return content[start_idx + len(start_marker):end_idx].strip()
-
-
-# =============================================================================
-# Prompt Generation
-# =============================================================================
-
-def generate_prompt(
-    style_template: str,
-    page_type: str,
-    content_text: str,
-    slide_number: int,
-    total_slides: int,
-) -> str:
-    """
-    Generate a prompt for a single slide.
-
-    Args:
-        style_template: Base style template text.
-        page_type: Type of page (cover, data, content).
-        content_text: Text content for the slide.
-        slide_number: Current slide number (1-indexed).
-        total_slides: Total number of slides.
-
-    Returns:
-        Complete prompt string for image generation.
-    """
-    prompt_parts = [style_template, "\n\n"]
-
-    # Determine page type based on slide position or explicit type
-    is_cover = page_type == "cover" or slide_number == 1
-    is_data = page_type == "data" or slide_number == total_slides
-
-    if is_cover:
-        prompt_parts.append(
-            f"""Please generate a cover page based on visual balance aesthetics.
-Place a large complex 3D glass object in the center, overlaid with bold text:
-
-{content_text}
-
-Background with extended aurora waves."""
-        )
-    elif is_data:
-        prompt_parts.append(
-            f"""Please generate a data/summary page using split-screen design.
-Left side: typeset the following text.
-Right side: floating large glowing 3D data visualization:
-
-{content_text}"""
-        )
-    else:
-        prompt_parts.append(
-            f"""Please generate a content page using Bento grid layout.
-Organize the following content in modular rounded rectangle containers.
-Container material must be frosted glass with blur effect:
-
-{content_text}"""
-        )
-
-    return "".join(prompt_parts)
-
-
-# =============================================================================
-# Image Generation
-# =============================================================================
-
-def get_qwen_client():
-    """
-    Initialize and return Qwen/DashScope OpenAI-compatible client.
-
-    Returns:
-        Configured OpenAI client pointing to DashScope.
-
-    Raises:
-        SystemExit: If openai is not installed or API key is missing.
-    """
+def generate_illustration(prompt: str, out_path: str) -> Optional[str]:
+    """Generate a square illustration with Qwen wanx."""
     try:
-        from openai import OpenAI
-    except ImportError:
-        print("Error: openai library not installed")
-        print("Please run: pip install openai")
-        sys.exit(1)
+        import dashscope
+        import requests
+        from dashscope import ImageSynthesis
 
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
-    if not api_key:
-        print("Error: DASHSCOPE_API_KEY environment variable not set")
-        print("Please set: export DASHSCOPE_API_KEY='your-api-key'")
-        sys.exit(1)
+        dashscope.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not dashscope.api_key:
+            return None
 
-    from openai import OpenAI
-    return OpenAI(
-        api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    )
-
-
-def generate_slide(
-    prompt: str,
-    slide_number: int,
-    output_dir: str,
-    resolution: str = DEFAULT_RESOLUTION,
-) -> Optional[str]:
-    """
-    Generate a single PPT slide image using Qwen wanx API.
-
-    Args:
-        prompt: The generation prompt.
-        slide_number: Slide number for filename.
-        output_dir: Output directory path.
-        resolution: Image resolution key (720p or 2K).
-
-    Returns:
-        Path to saved image, or None if generation failed.
-    """
-    import requests
-
-    size = RESOLUTION_MAP.get(resolution, "1280*720")
-    print(f"Generating slide {slide_number} ({size})...")
-
-    try:
-        client = get_qwen_client()
-        response = client.images.generate(
+        rsp = ImageSynthesis.call(
             model="wanx2.1-t2i-turbo",
             prompt=prompt,
-            size=size,
             n=1,
+            size="1024*1024",
         )
+        if rsp.status_code != 200 or not rsp.output.results:
+            msg = getattr(rsp.output, "message", "unknown")
+            print(f"    Illustration API error: {msg}")
+            return None
 
-        image_url = response.data[0].url
-        image_path = os.path.join(output_dir, "images", f"slide-{slide_number:02d}.png")
-
-        img_data = requests.get(image_url, timeout=60).content
-        with open(image_path, "wb") as f:
-            f.write(img_data)
-
-        print(f"  Slide {slide_number} saved: {image_path}")
-        return image_path
-
+        url = rsp.output.results[0].url
+        data = requests.get(url, timeout=60).content
+        with open(out_path, "wb") as f:
+            f.write(data)
+        return out_path
     except Exception as e:
-        print(f"  Slide {slide_number} failed: {e}")
+        print(f"    Illustration skipped: {e}")
         return None
 
 
-# =============================================================================
-# Output Generation
-# =============================================================================
-
-def generate_viewer_html(
-    output_dir: str,
-    slide_count: int,
-    template_path: str,
-) -> str:
-    """
-    Generate HTML viewer for slides playback.
-
-    Args:
-        output_dir: Output directory path.
-        slide_count: Total number of slides.
-        template_path: Path to HTML template.
-
-    Returns:
-        Path to generated HTML file.
-    """
-    with open(template_path, "r", encoding="utf-8") as f:
-        html_template = f.read()
-
-    # Generate image list
-    slides_list = [f"'images/slide-{i:02d}.png'" for i in range(1, slide_count + 1)]
-
-    # Replace placeholder
-    html_content = html_template.replace(
-        "/* IMAGE_LIST_PLACEHOLDER */",
-        ",\n            ".join(slides_list),
+def make_illust_prompt(slide_info: dict) -> str:
+    content = slide_info["content"][:120]
+    return (
+        f"Minimalist flat illustration, dark navy background, "
+        f"cyan accent color, depicting: {content}. "
+        f"Clean vector style, no text, professional infographic aesthetic."
     )
-
-    html_path = os.path.join(output_dir, "index.html")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    print(f"  Viewer HTML generated: {html_path}")
-    return html_path
-
-
-def save_prompts(output_dir: str, prompts_data: Dict[str, Any]) -> str:
-    """
-    Save all prompts to JSON file.
-
-    Args:
-        output_dir: Output directory path.
-        prompts_data: Dictionary containing all prompts and metadata.
-
-    Returns:
-        Path to saved JSON file.
-    """
-    prompts_path = os.path.join(output_dir, "prompts.json")
-    with open(prompts_path, "w", encoding="utf-8") as f:
-        json.dump(prompts_data, f, ensure_ascii=False, indent=2)
-    print(f"  Prompts saved: {prompts_path}")
-    return prompts_path
 
 
 # =============================================================================
-# Main Entry Point
+# Slide helpers
 # =============================================================================
 
-def create_argument_parser() -> argparse.ArgumentParser:
-    """Create and configure argument parser."""
-    parser = argparse.ArgumentParser(
-        description="PPT Generator - Generate PPT images using Gemini API",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example usage:
-  python generate_ppt.py --plan slides_plan.json --style styles/gradient-glass.md --resolution 2K
-
-Environment variables:
-  GEMINI_API_KEY: Google AI API key (required)
-""",
-    )
-
-    parser.add_argument(
-        "--plan",
-        required=True,
-        help="Path to slides plan JSON file (generated by Skill)",
-    )
-    parser.add_argument(
-        "--style",
-        required=True,
-        help="Path to style template file",
-    )
-    parser.add_argument(
-        "--resolution",
-        choices=["720p", "2K"],
-        default=DEFAULT_RESOLUTION,
-        help=f"Image resolution: 720p=1280x720, 2K=1792x1024 (default: {DEFAULT_RESOLUTION})",
-    )
-    parser.add_argument(
-        "--output",
-        help="Output directory path (default: outputs/TIMESTAMP)",
-    )
-    parser.add_argument(
-        "--template",
-        default=DEFAULT_TEMPLATE_PATH,
-        help=f"HTML template path (default: {DEFAULT_TEMPLATE_PATH})",
-    )
-
-    return parser
+def add_bg(slide):
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = COLOR_BG
 
 
-def main() -> None:
-    """Main entry point for PPT generation."""
-    # Load environment variables
+def add_accent_bar(slide):
+    bar = slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(0.08), SLIDE_H)
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = COLOR_ACCENT
+    bar.line.fill.background()
+
+
+def add_divider(slide, x, y, w):
+    line = slide.shapes.add_shape(1, x, y, w, Pt(3))
+    line.fill.solid()
+    line.fill.fore_color.rgb = COLOR_ACCENT
+    line.line.fill.background()
+
+
+def textbox(slide, x, y, w, h, text, size, bold=False, color=None, align=PP_ALIGN.LEFT, wrap=True):
+    tb = slide.shapes.add_textbox(x, y, w, h)
+    tf = tb.text_frame
+    tf.word_wrap = wrap
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = text
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color or COLOR_HEADING
+    return tf
+
+
+def add_bullets(slide, x, y, w, h, bullets, size=20):
+    tb = slide.shapes.add_textbox(x, y, w, h)
+    tf = tb.text_frame
+    tf.word_wrap = True
+    for i, bullet in enumerate(bullets):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.space_before = Pt(5)
+        run = p.add_run()
+        run.text = bullet
+        run.font.size = Pt(size)
+        run.font.color.rgb = COLOR_BODY
+    return tf
+
+
+# =============================================================================
+# Slide builders
+# =============================================================================
+
+def build_cover(slide, slide_info):
+    add_bg(slide)
+    add_accent_bar(slide)
+
+    lines = [l.strip() for l in slide_info["content"].strip().splitlines() if l.strip()]
+    title    = lines[0].replace("标题：", "") if lines else "Title"
+    subtitle = lines[1].replace("副标题：", "") if len(lines) > 1 else ""
+    date     = lines[2].replace("时间：", "") if len(lines) > 2 else ""
+
+    textbox(slide, Inches(1), Inches(2.0), Inches(11), Inches(2.0),
+            title, 48, bold=True, align=PP_ALIGN.LEFT)
+    if subtitle:
+        textbox(slide, Inches(1), Inches(4.2), Inches(10), Inches(1.0),
+                subtitle, 22, color=COLOR_COVER_SUB)
+    if date:
+        textbox(slide, Inches(1), Inches(5.4), Inches(6), Inches(0.5),
+                date, 14, color=COLOR_BODY)
+
+
+def build_content(slide, slide_info, illust_path=None):
+    add_bg(slide)
+    add_accent_bar(slide)
+
+    lines = [l.strip() for l in slide_info["content"].strip().splitlines() if l.strip()]
+    title   = lines[0]
+    bullets = lines[1:]
+
+    has_img = illust_path and os.path.exists(illust_path)
+    text_w  = Inches(7.8) if has_img else Inches(12.3)
+
+    textbox(slide, Inches(0.5), Inches(0.35), text_w, Inches(1.0),
+            title, 32, bold=True)
+    add_divider(slide, Inches(0.5), Inches(1.45), text_w)
+    add_bullets(slide, Inches(0.5), Inches(1.65), text_w, Inches(5.6), bullets, size=21)
+
+    if has_img:
+        slide.shapes.add_picture(illust_path, Inches(8.5), Inches(1.1), Inches(4.5), Inches(4.5))
+
+
+def build_data(slide, slide_info, illust_path=None):
+    add_bg(slide)
+    add_accent_bar(slide)
+
+    lines = [l.strip() for l in slide_info["content"].strip().splitlines() if l.strip()]
+    title = lines[0]
+    items = lines[1:]
+
+    textbox(slide, Inches(0.5), Inches(0.35), Inches(12.5), Inches(1.0),
+            title, 32, bold=True)
+    add_divider(slide, Inches(0.5), Inches(1.45), Inches(12.5))
+
+    cols = 3
+    card_w = Inches(3.9)
+    card_h = Inches(1.6)
+
+    for i, item in enumerate(items[:6]):
+        col = i % cols
+        row = i // cols
+        x = Inches(0.5) + col * Inches(4.3)
+        y = Inches(1.7) + row * Inches(2.0)
+
+        card = slide.shapes.add_shape(1, x, y, card_w, card_h)
+        card.fill.solid()
+        card.fill.fore_color.rgb = COLOR_CARD_BG
+        card.line.color.rgb = COLOR_ACCENT
+        card.line.width = Pt(1)
+
+        parts = item.split("：", 1) if "：" in item else item.split(":", 1)
+        tb = slide.shapes.add_textbox(x + Inches(0.2), y + Inches(0.15),
+                                       card_w - Inches(0.4), card_h - Inches(0.25))
+        tf = tb.text_frame
+        tf.word_wrap = True
+
+        if len(parts) == 2:
+            p = tf.paragraphs[0]
+            r = p.add_run()
+            r.text = parts[0].strip()
+            r.font.size = Pt(13)
+            r.font.color.rgb = COLOR_ACCENT
+            r.font.bold = True
+
+            p2 = tf.add_paragraph()
+            r2 = p2.add_run()
+            r2.text = parts[1].strip()
+            r2.font.size = Pt(19)
+            r2.font.color.rgb = COLOR_HEADING
+            r2.font.bold = True
+        else:
+            p = tf.paragraphs[0]
+            r = p.add_run()
+            r.text = item
+            r.font.size = Pt(17)
+            r.font.color.rgb = COLOR_BODY
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
     find_and_load_env()
 
-    # Parse arguments
-    parser = create_argument_parser()
+    parser = argparse.ArgumentParser(description="PPT Generator - text slides + AI illustrations")
+    parser.add_argument("--plan", required=True, help="slides_plan.json path")
+    parser.add_argument("--output", default=None, help="output directory")
+    parser.add_argument("--no-illustrations", action="store_true", help="skip AI illustration generation")
     args = parser.parse_args()
 
-    # Load slides plan
-    with open(args.plan, "r", encoding="utf-8") as f:
-        slides_plan = json.load(f)
+    with open(args.plan, encoding="utf-8") as f:
+        plan = json.load(f)
 
-    # Load style template
-    style_template = load_style_template(args.style)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = args.output or f"{OUTPUT_BASE_DIR}/{timestamp}"
+    img_dir = os.path.join(out_dir, "illustrations")
+    os.makedirs(img_dir, exist_ok=True)
 
-    # Create output directory
-    if args.output:
-        output_dir = args.output
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"{OUTPUT_BASE_DIR}/{timestamp}"
+    print(f"{'='*60}")
+    print(f"PPT: {plan.get('title', 'Untitled')}")
+    print(f"Slides: {len(plan['slides'])}  |  Output: {out_dir}")
+    print(f"{'='*60}\n")
 
-    os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+    prs = Presentation()
+    prs.slide_width = SLIDE_W
+    prs.slide_height = SLIDE_H
+    blank = prs.slide_layouts[6]
 
-    # Print configuration
-    slides = slides_plan["slides"]
-    total_slides = len(slides)
+    for slide_info in plan["slides"]:
+        num   = slide_info["slide_number"]
+        ptype = slide_info.get("page_type", "content")
+        print(f"Slide {num} ({ptype})...")
 
-    print("=" * 60)
-    print("PPT Generator Started")
-    print("=" * 60)
-    print(f"Style: {args.style}")
-    print(f"Resolution: {args.resolution}")
-    print(f"Slides: {total_slides}")
-    print(f"Output: {output_dir}")
-    print("=" * 60)
-    print()
+        illust_path = None
+        if not args.no_illustrations and ptype != "cover":
+            illust_file = os.path.join(img_dir, f"illust-{num:02d}.png")
+            print("  Generating illustration...")
+            illust_path = generate_illustration(make_illust_prompt(slide_info), illust_file)
+            if illust_path:
+                print(f"  Illustration saved: {illust_file}")
 
-    # Initialize prompts data
-    prompts_data: Dict[str, Any] = {
-        "metadata": {
-            "title": slides_plan.get("title", "Untitled Presentation"),
-            "total_slides": total_slides,
-            "resolution": args.resolution,
-            "style": args.style,
-            "generated_at": datetime.now().isoformat(),
-        },
-        "slides": [],
-    }
+        slide = prs.slides.add_slide(blank)
 
-    # Generate each slide
-    for slide_info in slides:
-        slide_number = slide_info["slide_number"]
-        page_type = slide_info.get("page_type", "content")
-        content_text = slide_info["content"]
+        if ptype == "cover":
+            build_cover(slide, slide_info)
+        elif ptype == "data":
+            build_data(slide, slide_info, illust_path)
+        else:
+            build_content(slide, slide_info, illust_path)
 
-        # Generate prompt
-        prompt = generate_prompt(
-            style_template,
-            page_type,
-            content_text,
-            slide_number,
-            total_slides,
-        )
+        print(f"  Slide {num} done\n")
 
-        # Generate image
-        image_path = generate_slide(prompt, slide_number, output_dir, args.resolution)
+    title = plan.get("title", "presentation")
+    pptx_path = os.path.join(out_dir, f"{title}.pptx")
+    prs.save(pptx_path)
 
-        # Record prompt data
-        prompts_data["slides"].append({
-            "slide_number": slide_number,
-            "page_type": page_type,
-            "content": content_text,
-            "prompt": prompt,
-            "image_path": image_path,
-        })
-
-        print()
-
-    # Save prompts
-    save_prompts(output_dir, prompts_data)
-
-    # Generate viewer HTML
-    generate_viewer_html(output_dir, total_slides, args.template)
-
-    # Print completion summary
-    print()
-    print("=" * 60)
-    print("Generation Complete!")
-    print("=" * 60)
-    print(f"Output directory: {output_dir}")
-    print(f"Viewer HTML: {os.path.join(output_dir, 'index.html')}")
-    print()
-    print("Open viewer in browser:")
-    print(f"  open {os.path.join(output_dir, 'index.html')}")
-    print()
+    print(f"{'='*60}")
+    print(f"Saved: {pptx_path}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

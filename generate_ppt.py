@@ -22,6 +22,12 @@ from dotenv import load_dotenv
 # =============================================================================
 
 DEFAULT_RESOLUTION = "2K"
+
+# Qwen wanx supported 16:9 resolutions
+RESOLUTION_MAP = {
+    "720p": "1280*720",
+    "2K": "1792*1024",
+}
 DEFAULT_TEMPLATE_PATH = "templates/viewer.html"
 OUTPUT_BASE_DIR = "outputs"
 
@@ -163,30 +169,34 @@ Container material must be frosted glass with blur effect:
 # Image Generation
 # =============================================================================
 
-def get_gemini_client():
+def get_qwen_client():
     """
-    Initialize and return Gemini API client.
+    Initialize and return Qwen/DashScope OpenAI-compatible client.
 
     Returns:
-        Configured genai.Client instance.
+        Configured OpenAI client pointing to DashScope.
 
     Raises:
-        SystemExit: If google-genai is not installed or API key is missing.
+        SystemExit: If openai is not installed or API key is missing.
     """
     try:
-        from google import genai
+        from openai import OpenAI
     except ImportError:
-        print("Error: google-genai library not installed")
-        print("Please run: pip install google-genai")
+        print("Error: openai library not installed")
+        print("Please run: pip install openai")
         sys.exit(1)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable not set")
-        print("Please set: export GEMINI_API_KEY='your-api-key'")
+        print("Error: DASHSCOPE_API_KEY environment variable not set")
+        print("Please set: export DASHSCOPE_API_KEY='your-api-key'")
         sys.exit(1)
 
-    return genai.Client(api_key=api_key)
+    from openai import OpenAI
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
 
 
 def generate_slide(
@@ -196,47 +206,40 @@ def generate_slide(
     resolution: str = DEFAULT_RESOLUTION,
 ) -> Optional[str]:
     """
-    Generate a single PPT slide image using Gemini API.
+    Generate a single PPT slide image using Qwen wanx API.
 
     Args:
         prompt: The generation prompt.
         slide_number: Slide number for filename.
         output_dir: Output directory path.
-        resolution: Image resolution (2K or 4K).
+        resolution: Image resolution key (720p or 2K).
 
     Returns:
         Path to saved image, or None if generation failed.
     """
-    from google.genai import types
+    import requests
 
-    print(f"Generating slide {slide_number}...")
+    size = RESOLUTION_MAP.get(resolution, "1280*720")
+    print(f"Generating slide {slide_number} ({size})...")
 
     try:
-        client = get_gemini_client()
-        response = client.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio="16:9",
-                    image_size=resolution,
-                ),
-            ),
+        client = get_qwen_client()
+        response = client.images.generate(
+            model="wanx2.1-t2i-turbo",
+            prompt=prompt,
+            size=size,
+            n=1,
         )
 
-        for part in response.parts:
-            if part.inline_data is not None:
-                image = part.as_image()
-                image_path = os.path.join(
-                    output_dir, "images", f"slide-{slide_number:02d}.png"
-                )
-                image.save(image_path)
-                print(f"  Slide {slide_number} saved: {image_path}")
-                return image_path
+        image_url = response.data[0].url
+        image_path = os.path.join(output_dir, "images", f"slide-{slide_number:02d}.png")
 
-        print(f"  Slide {slide_number} failed: No image data received")
-        return None
+        img_data = requests.get(image_url, timeout=60).content
+        with open(image_path, "wb") as f:
+            f.write(img_data)
+
+        print(f"  Slide {slide_number} saved: {image_path}")
+        return image_path
 
     except Exception as e:
         print(f"  Slide {slide_number} failed: {e}")
@@ -331,9 +334,9 @@ Environment variables:
     )
     parser.add_argument(
         "--resolution",
-        choices=["2K", "4K"],
+        choices=["720p", "2K"],
         default=DEFAULT_RESOLUTION,
-        help=f"Image resolution (default: {DEFAULT_RESOLUTION})",
+        help=f"Image resolution: 720p=1280x720, 2K=1792x1024 (default: {DEFAULT_RESOLUTION})",
     )
     parser.add_argument(
         "--output",
